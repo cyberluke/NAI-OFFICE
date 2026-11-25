@@ -23,7 +23,7 @@ works inside your documents.
 
 ## Install
 
-**Windows x86-64** — [download the latest installer](https://nanotrik.ai/office/). It installs to `C:\Program Files\NAI_OFFICE 27`
+**Windows x86-64** — [download the latest installer](https://nanotrik.ai/office/) or take it from the [latest GitHub release](https://github.com/cyberluke/NAI-OFFICE/releases/latest). It installs to `C:\Program Files\NAI_OFFICE 27`
 and includes the AI assistant and its Chromium runtime, so there is nothing else to set up.
 
 **Linux and macOS** — build from source with the instructions below.
@@ -58,14 +58,30 @@ An AI assistant that lives in the sidebar and understands the document you are e
 
 ### Creator Studio
 
-Agentic long-form writing for novels, books, articles and comics.
+**Your AI co-writer does not just autocomplete. It performs.**
 
-- The writer agent types into your open Writer document while you watch, and you can edit
-  alongside it.
-- Your outline, characters and scene notes stay in sync with the document text.
-- Steer it mid-draft: pause, resume, stop, restyle, insert images, or rewrite a paragraph
-  with a second agent.
-- One undo step per chapter.
+ChatGPT is helping you write. Fine. Every assistant can suggest the next sentence.
+Creator Studio puts a *writer's room* inside your document — and then it hires a critic
+with a taste for blood.
+
+- **It types into the live document.** Not a chat bubble, not a preview pane: the agent
+  writes into your open Writer document, paragraph by paragraph, while you watch. Edit
+  beside it. Take the wheel mid-sentence.
+- **Your story stays yours.** Outline, characters, scene notes and continuity live in a
+  structured Author IR that is two-way synced with the document. Close the file, reopen
+  it, and the studio still remembers who is lying to whom.
+- **You direct. It drafts.** Pause the stream, resume it, restyle the page, drop in an
+  image, or hand a stubborn paragraph to a second agent for a rewrite — without stopping
+  the session. One undo step per chapter, so a bad idea is exactly one Ctrl+Z away.
+- **Meet the Adversarial Joker Agent (AJA).** From the third chapter onward, a second
+  agent reads over your shoulder and plays the reader who *wants to spoil the ending*: it
+  tries to guess **who the murderer is**. One accusation per chapter. If AJA is right, the
+  draft is dead — you or your AI Writer Agent rewrite that chapter (or the whole book)
+  until the reveal survives a mind that is actively hunting it.
+
+  Write a mystery that cannot be guessed. Or at least one that survives the joker.
+
+> **Kind Reminder:** NAI OFFICE Writer 2027 does not support "writer's block".
 
 ### Interface
 
