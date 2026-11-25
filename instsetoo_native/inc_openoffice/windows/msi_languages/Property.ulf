@@ -20,13 +20,13 @@
 en-US = "NAI Office"
 
 [OOO_ARPHELPLINKTEMPLATE]
-en-US = "https://www.nanotrik.ai"
+en-US = "https://nanotrik.ai/office/"
 
 [OOO_ARPURLINFOABOUTTEMPLATE]
-en-US = "https://www.nanotrik.ai"
+en-US = "https://nanotrik.ai/office/"
 
 [OOO_ARPURLUPDATEINFOTEMPLATE]
-en-US = "https://www.nanotrik.ai"
+en-US = "https://nanotrik.ai/office/"
 
 [OOO_STR_NEW_DISPLAY_NAME]
 en-US = "~New"

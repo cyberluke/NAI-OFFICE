@@ -23,7 +23,7 @@ works inside your documents.
 
 ## Install
 
-**Windows x86-64** — run the release MSI. It installs to `C:\Program Files\NAI_OFFICE 27`
+**Windows x86-64** — [download the latest installer](https://nanotrik.ai/office/). It installs to `C:\Program Files\NAI_OFFICE 27`
 and includes the AI assistant and its Chromium runtime, so there is nothing else to set up.
 
 **Linux and macOS** — build from source with the instructions below.

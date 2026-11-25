@@ -208,7 +208,7 @@ RegistryItem gid_Regitem_Software_Microsoft_Windows_Currentversion_Uninstall_Sta
     ModuleID = gid_Module_Root;
     Subkey = "Software\Microsoft\Windows\CurrentVersion\Uninstall\%PRODUCTNAME %PRODUCTVERSION";
     Name = "HelpLink";
-    Value = "https://www.nanotrik.ai";
+    Value = "https://nanotrik.ai/office/";
 End
 
 RegistryItem gid_Regitem_Software_Microsoft_Windows_Currentversion_Uninstall_Staroffice_Modifypath
@@ -240,7 +240,7 @@ RegistryItem gid_Regitem_Software_Microsoft_Windows_Currentversion_Uninstall_Sta
     ModuleID = gid_Module_Root;
     Subkey = "Software\Microsoft\Windows\CurrentVersion\Uninstall\%PRODUCTNAME %PRODUCTVERSION";
     Name = "URLInfoAbout";
-    Value = "https://www.nanotrik.ai";
+    Value = "https://nanotrik.ai/office/";
 End
 
 RegistryItem gid_Regitem_Software_Microsoft_Windows_Currentversion_Uninstall_Staroffice_Urlupdateinfo
