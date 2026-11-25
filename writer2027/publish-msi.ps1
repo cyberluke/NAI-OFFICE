@@ -5,12 +5,12 @@
 # updater points at "NAI Office_27.2.0.0.alpha0_...msi", every release breaks
 # every link. This script publishes:
 #
-#   <out>/NAIOffice-Windows-x64.msi                     <- canonical, always this URL
-#   <out>/archive/NAIOffice-<version>-Windows-x64.msi   <- immutable per release
+#   <out>/NAIOffice-Setup-x64.msi                     <- canonical, always this URL
+#   <out>/archive/NAIOffice-<version>-Setup-x64.msi   <- immutable per release
 #   <out>/latest.json                                   <- version, size, sha256, url
 #
 # Upload the canonical file over the previous one and keep the archive copy.
-# Consumers use https://updates.nanotrik.ai/naioffice/NAIOffice-Windows-x64.msi, or
+# Consumers use https://updates.nanotrik.ai/naioffice/NAIOffice-Setup-x64.msi, or
 # read latest.json to show the version and verify the download.
 #
 # Usage:
@@ -22,7 +22,7 @@ param(
     [string]$SourceMsi,
     [string]$OutDir = (Join-Path (Resolve-Path (Join-Path $PSScriptRoot '..')).Path 'dist'),
     [string]$BaseUrl = 'https://updates.nanotrik.ai/naioffice',
-    [string]$CanonicalName = 'NAIOffice-Windows-x64.msi'
+    [string]$CanonicalName = 'NAIOffice-Setup-x64.msi'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -53,7 +53,7 @@ if (-not $SourceMsi) {
 if (-not (Test-Path -LiteralPath $SourceMsi)) { throw "MSI not found: $SourceMsi" }
 
 $version = Get-MsiProductVersion -Path $SourceMsi
-$archiveName = 'NAIOffice-{0}-Windows-x64.msi' -f $version
+$archiveName = 'NAIOffice-{0}-Setup-x64.msi' -f $version
 
 $canonicalPath = Join-Path $OutDir $CanonicalName
 $archiveDir = Join-Path $OutDir 'archive'
