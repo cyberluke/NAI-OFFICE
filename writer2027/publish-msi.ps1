@@ -10,18 +10,18 @@
 #   <out>/latest.json                                   <- version, size, sha256, url
 #
 # Upload the canonical file over the previous one and keep the archive copy.
-# Consumers use https://a.nanotrik.ai/naioffice/NAIOffice-Windows-x64.msi, or
+# Consumers use https://updates.nanotrik.ai/naioffice/NAIOffice-Windows-x64.msi, or
 # read latest.json to show the version and verify the download.
 #
 # Usage:
 #   pwsh -File writer2027/publish-msi.ps1
-#   pwsh -File writer2027/publish-msi.ps1 -SourceMsi <path> -OutDir dist -BaseUrl https://a.nanotrik.ai/naioffice
+#   pwsh -File writer2027/publish-msi.ps1 -SourceMsi <path> -OutDir dist -BaseUrl https://updates.nanotrik.ai/naioffice
 
 [CmdletBinding()]
 param(
     [string]$SourceMsi,
     [string]$OutDir = (Join-Path (Resolve-Path (Join-Path $PSScriptRoot '..')).Path 'dist'),
-    [string]$BaseUrl = 'https://a.nanotrik.ai/naioffice',
+    [string]$BaseUrl = 'https://updates.nanotrik.ai/naioffice',
     [string]$CanonicalName = 'NAIOffice-Windows-x64.msi'
 )
 
