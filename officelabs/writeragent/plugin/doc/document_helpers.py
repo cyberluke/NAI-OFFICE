@@ -1,0 +1,972 @@
+# WriterAgent - AI Writing Assistant for LibreOffice
+# Copyright (c) 2024 John Balis
+# Copyright (c) 2026 KeithCu (modifications and relicensing)
+# Copyright (c) 2026 LibreCalc AI Assistant (Calc integration features, originally MIT)
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+"""Writer chat-context assembler and ``DocumentService``.
+
+Text/path/selection helpers live in ``plugin.doc.text_helpers`` (LibrePy-safe).
+Document resolution lives in ``plugin.framework.uno_context``. Streamed Writer
+edits live in ``plugin.writer.edit_review``. Calc chat context lives in
+``plugin.calc.analyzer``. Draw/Impress chat context lives in
+``plugin.draw.bridge``. Paragraph range helpers live in
+``plugin.doc.paragraph_search``. Do not re-export those names here — a
+re-export of ``get_calc_context_for_chat`` would pull ``SheetAnalyzer`` at
+import time and break LibrePy.
+"""
+from __future__ import annotations
+
+import logging
+import weakref
+from contextlib import contextmanager
+from typing import TYPE_CHECKING, Any, cast
+
+if TYPE_CHECKING:
+    from collections.abc import Generator
+
+from plugin.doc import doc_type as _doc_type
+from plugin.doc import text_helpers as _text_helpers
+from plugin.doc.paragraph_search import (
+    find_paragraph_for_range as _find_paragraph_for_range,
+    get_paragraph_ranges as _get_paragraph_ranges,
+)
+from plugin.framework.constants import CHAT_DOCUMENT_CONTEXT_MAX_CHARS
+from plugin.framework.errors import (
+    ToolExecutionError,
+    UnoObjectError,
+    check_disposed,
+    safe_call,
+)
+from plugin.framework.service import ServiceBase
+from plugin.framework.thread_guard import main_thread_only
+from plugin.framework.uno_context import (
+    get_active_document,
+    get_ctx,
+    get_runtime_uid,
+    normalize_doc_url,
+    resolve_document_by_url as _resolve_document_by_url,
+)
+log = logging.getLogger("writeragent.document")
+
+# Cache key when RuntimeUID and URL are both missing. Must not collide across
+# docs — callers must not store under this sentinel (see is_cacheable_doc_key).
+UNKNOWN_DOC_KEY = "unknown"
+
+# One modify+unload pair per open document, keyed by doc_key (not id(doc)).
+# Module-level so extra DocumentService() objects in tests do not double-attach.
+_CACHE_LISTENERS: dict[str, "_CacheListenerPair"] = {}
+_IGNORE_DEPTH = 0
+
+# Do not import uno_listeners here: that module imports unohelper at load,
+# which breaks the isolated document_helpers import (LibrePy / no soffice).
+_unohelper: Any = None
+_XDocumentEventListener: Any = object
+_XModifyListener: Any = object
+_HAVE_UNO_LISTENERS = False
+try:
+    import unohelper as _unohelper_impl
+    from com.sun.star.document import XDocumentEventListener as _XDocumentEventListener_impl
+    from com.sun.star.util import XModifyListener as _XModifyListener_impl
+
+    _unohelper = _unohelper_impl
+    _XDocumentEventListener = _XDocumentEventListener_impl
+    _XModifyListener = _XModifyListener_impl
+    _HAVE_UNO_LISTENERS = True
+except ImportError:
+    pass
+
+
+@main_thread_only
+def get_full_document_text(model: Any, max_chars: int = CHAT_DOCUMENT_CONTEXT_MAX_CHARS) -> str:
+    """Dispatch full-text / summary by document type.
+
+    Writer slices live in ``text_helpers``. Draw/Impress summaries live on
+    ``plugin.draw.bridge``. Calc is lazy so this module does not load
+    ``SheetAnalyzer`` at import time.
+    """
+    try:
+        check_disposed(model, "Document Model")
+        doc_type = _doc_type.get_document_type(model)
+
+        if doc_type == _doc_type.DocumentType.CALC:
+            from plugin.calc.analyzer import get_full_calc_text
+
+            return get_full_calc_text(model, max_chars)
+
+        if doc_type == _doc_type.DocumentType.WRITER:
+            return _text_helpers.get_full_writer_text(model, max_chars)
+
+        if doc_type in (_doc_type.DocumentType.DRAW, _doc_type.DocumentType.IMPRESS):
+            from plugin.draw.bridge import get_draw_context_for_chat
+
+            return get_draw_context_for_chat(model, max_chars)
+
+        return ""
+    except UnoObjectError:
+        logging.getLogger(__name__).exception("get_full_document_text failed")
+        return ""
+
+
+def _writer_has_math_ole(model: Any) -> bool:
+    """True when the Writer doc has at least one LibreOffice Math embedded object."""
+    try:
+        from plugin.writer.math.math_mml_convert import MATH_CLSID
+
+        container = model.getEmbeddedObjects()
+        names = container.getElementNames()
+        # Index by length — iterating a MagicMock in unit tests would never end.
+        if names is None:
+            return False
+        n = len(names)
+        for i in range(n):
+            obj = container.getByName(names[i])
+            if str(getattr(obj, "CLSID", "") or "").lower() == MATH_CLSID.lower():
+                return True
+    except Exception:
+        log.debug("Failed checking Math OLE objects in Writer document", exc_info=True)
+        return False
+    return False
+
+
+def _with_math_ole_chat_hint(model: Any, body: str) -> str:
+    """Plain-text excerpts skip Math OLE; point the model at get_document_content."""
+    if not _writer_has_math_ole(model):
+        return body
+    return (
+        body
+        + "\n\nMath formulas are LibreOffice Math objects (OLE), not characters in the "
+        "excerpt above, so Document length may omit them. Call get_document_content to "
+        "read them as TeX."
+    )
+
+
+@main_thread_only
+def get_document_context_for_chat(
+    model: Any,
+    max_context: int = CHAT_DOCUMENT_CONTEXT_MAX_CHARS,
+    include_end: bool = True,
+    include_selection: bool = True,
+    ctx: Any | None = None,
+) -> str:
+    """Build a single context string for chat. Handles Writer, Calc and Draw.
+    ctx: component context (required for Calc and Draw documents)."""
+    try:
+        doc_type = _doc_type.get_document_type(model)
+
+        if doc_type == _doc_type.DocumentType.CALC:
+            from plugin.calc.analyzer import get_calc_context_for_chat
+
+            return get_calc_context_for_chat(model, max_context, ctx)
+
+        if doc_type in (_doc_type.DocumentType.DRAW, _doc_type.DocumentType.IMPRESS):
+            from plugin.draw.bridge import get_draw_context_for_chat
+
+            return get_draw_context_for_chat(model, max_context, ctx)
+
+        # Writer: plain-text start/end slices (hides tracked deletions). Math OLE is not
+        # in getString(); we only hint to call get_document_content.
+        if doc_type == _doc_type.DocumentType.WRITER:
+            try:
+                check_disposed(model, "Document Model")
+                doc_len = _text_helpers._writer_char_count(model)
+            except UnoObjectError:
+                logging.getLogger(__name__).exception("get_document_context_for_chat Writer failed, trying fallback to selection-only")
+                sel_text = _text_helpers.get_selection_text(model)
+                if sel_text:
+                    return f"[Document text reading failed. Active selection: {sel_text}]"
+                return "[Document content unavailable]"
+
+            # Split only when the document does not fit. A threshold of
+            # max_context // 2 sends a document that still fits
+            # (half < doc_len <= max_context) through a head window and a
+            # tail window that overlap, so the middle is repeated, and the
+            # "middle omitted" note stays off because doc_len is not past
+            # the budget. One slice when the document fits. Head and tail
+            # only when it does not. Those windows cannot overlap: together
+            # they are max_context characters and the body is longer than
+            # that, so the tail starts after the head.
+            use_head_tail = include_end and doc_len > max_context
+            if use_head_tail:
+                start_chars = max_context // 2
+                end_chars = max_context - start_chars
+                # Document text goes from 0 to doc_len, we take end_chars.
+                excerpt_windows = [(0, start_chars), (max(0, doc_len - end_chars), doc_len)]
+            else:
+                start_chars = 0
+                end_chars = 0
+                take = min(doc_len, max_context)
+                excerpt_windows = [(0, take)]
+
+            # The windows are in cursor steps (doc_len); the model is shown the visible length,
+            # the number get_document_content reports as document_length. Cursor steps also count
+            # pending deleted text, so the two disagreed in review mode (3405 vs 2439).
+            shown_len = _text_helpers.get_document_length(model)
+
+            start_offset, end_offset = (0, 0)
+            if include_selection:
+                sel_positions = _text_helpers._get_writer_selection_positions(model)
+                if sel_positions is not None and _text_helpers._writer_selection_overlaps_windows(model, excerpt_windows, sel_positions[1], sel_positions[2]):
+                    start_offset, end_offset = _text_helpers.get_selection_range(model)
+                    start_offset = max(0, min(start_offset, doc_len))
+                    end_offset = max(0, min(end_offset, doc_len))
+                    if start_offset > end_offset:
+                        start_offset, end_offset = end_offset, start_offset
+                    max_selection_span = 2000
+                    if end_offset - start_offset > max_selection_span:
+                        end_offset = start_offset + max_selection_span
+
+            if use_head_tail:
+                tail_start = max(0, doc_len - end_chars)
+                start_excerpt = _text_helpers._read_writer_text_slice(model, 0, start_chars)
+                end_excerpt = _text_helpers._read_writer_text_slice(model, tail_start, end_chars)
+                start_excerpt = _inject_markers_into_excerpt(start_excerpt, 0, start_chars, start_offset, end_offset, "[DOCUMENT START]\n", "\n[DOCUMENT END]")
+                end_excerpt = _inject_markers_into_excerpt(end_excerpt, tail_start, doc_len, start_offset, end_offset, "[DOCUMENT CONTINUE]\n", "\n[END DOCUMENT]")
+                middle_note = "\n\n[... middle of document omitted ...]\n\n"
+                return _with_math_ole_chat_hint(
+                    model,
+                    _chat_context_with_language_header(
+                        model,
+                        "Document length: %d characters.\n\n%s%s%s" % (shown_len, start_excerpt, middle_note, end_excerpt),
+                    ),
+                )
+
+            take = min(doc_len, max_context)
+            excerpt = _text_helpers._read_writer_text_slice(model, 0, take)
+            if doc_len > max_context:
+                excerpt += "\n\n[... document truncated ...]"
+            excerpt = _inject_markers_into_excerpt(excerpt, 0, take, start_offset, end_offset, "[DOCUMENT START]\n", "\n[END DOCUMENT]")
+            return _with_math_ole_chat_hint(
+                model,
+                _chat_context_with_language_header(
+                    model,
+                    "Document length: %d characters.\n\n%s" % (shown_len, excerpt),
+                ),
+            )
+
+        return ""
+    except Exception:
+        logging.getLogger(__name__).exception("get_document_context_for_chat unexpected failure, trying selection fallback")
+        try:
+            sel_text = _text_helpers.get_selection_text(model)
+            if sel_text:
+                return f"[Document context resolution failed. Active selection: {sel_text}]"
+        except Exception:
+            pass
+        return "[Document content unavailable]"
+
+
+def _read_document_language_bcp47(model: Any) -> str | None:
+    """Return the language (BCP-47 2-letter code) that should drive AI replies.
+
+    Resolution order (most-specific first), so an English selection inside a
+    Czech document is answered in English:
+        1. active selection/cursor range (dominant CharLocale of its portions)
+        2. current paragraph/selection property
+        3. document / default paragraph CharLocale
+        4. None (caller falls back to UI locale)
+    Read-only, bounded, best-effort; never raises.
+    """
+    try:
+        controller = model.getCurrentController()
+        if controller is not None:
+            sel = controller.getSelection()
+            if sel is not None and hasattr(sel, "getByIndex"):
+                rng = sel.getByIndex(0)
+                lang = _dominant_locale_of_range(rng, budget_chars=4000)
+                if lang:
+                    return lang
+                # A collapsed cursor returns nothing; fall through to the
+                # cursor/paragraph property below.
+                lang = _lang_code_of_props(rng)
+                if lang:
+                    return lang
+    except Exception:
+        pass
+    # Document-level default paragraph languages, then the doc property.
+    try:
+        for prop in ("CharLocale", "CharLocaleAsian", "CharLocaleComplex"):
+            try:
+                loc = model.getPropertyValue(prop)
+                lang = _lang_code_from_locale(loc)
+                if lang:
+                    return lang
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
+
+_SELECTION_LOCALE_BUDGET = 4000
+
+
+def _lang_code_of_props(obj: Any) -> str | None:
+    """Language code from the ``CharLocale*`` properties of a UNO object, or None."""
+    for prop in ("CharLocale", "CharLocaleAsian", "CharLocaleComplex"):
+        try:
+            lang = _lang_code_from_locale(obj.getPropertyValue(prop))
+            if lang:
+                return lang
+        except Exception:
+            continue
+    return None
+
+
+def _dominant_locale_of_range(rng: Any, budget_chars: int) -> str | None:
+    """Dominant language of a text range by sampled char count, bounded.
+
+    Samples the ``CharLocale`` of each character span by walking the range with
+    a ``XTextCursor`` via ``goRight`` (the most stable cursor primitive), and
+    counts characters per sampled language. The scan stops after
+    ``budget_chars`` characters so a huge selection cannot stall the UI thread.
+    Returns None when the range is empty, has no text, or exposes no locale.
+
+    Falls back to the range's own ``CharLocale`` property (the cursor char)
+    when cursor enumeration is unavailable.
+    """
+    counted: dict[str, int] = {}
+    total = 0
+    try:
+        text = rng.getText()
+        cursor = text.createTextCursorByRange(rng)
+        # Sample the locale at the cursor, then step one character.
+        while True:
+            lang = _lang_code_of_props(cursor)
+            if lang:
+                counted[lang] = counted.get(lang, 0) + 1
+            total += 1
+            if total >= budget_chars:
+                break
+            try:
+                # goRight(1, False): move one char without extending the selection.
+                cursor.goRight(1, False)
+            except Exception:
+                break
+    except Exception:
+        # Portions unavailable (e.g. a bookmark/other range): use the range's props.
+        return _lang_code_of_props(rng)
+    if not counted:
+        return _lang_code_of_props(rng)
+    return max(counted, key=counted.get)
+
+
+def _lang_code_from_locale(locale: Any) -> str | None:
+    """``Language`` → lowercase 2-letter code, or None."""
+    try:
+        if locale is None:
+            return None
+        lang = str(getattr(locale, "Language", "") or "").strip().lower()
+        return lang[:2] if lang else None
+    except Exception:
+        return None
+
+
+def _chat_context_with_language_header(model: Any, body: str) -> str:
+    """Prepend a language directive so the model replies in the right language.
+
+    Selection-first resolution (see ``_read_document_language_bcp47``) means an
+    English selection in a Czech document edits in English, while general chat
+    over a Czech document answers in Czech. The directive is phrased as a
+    policy, not an override, so explicit requests like "translate to English"
+    still win.
+
+    When no document language is set, the UI locale is a soft fallback; if that
+    also fails, the body is returned unchanged.
+    """
+    lang = _read_document_language_bcp47(model)
+    if lang:
+        return (
+            f"[Primary document language: {lang}. "
+            "Preserve the language of selected/source text when editing or rewriting it. "
+            "For general responses, use the document language unless the user requests another language.]\n\n"
+            + body
+        )
+    ui_lang = _ui_locale_language()
+    if ui_lang:
+        return f"[Language: {ui_lang}]\n\n" + body
+    return body
+
+
+def _ui_locale_language() -> str | None:
+    """``en_US`` → ``en`` via the active UI locale, or None."""
+    try:
+        from plugin.framework.i18n import get_active_locale
+        locale = get_active_locale() or ""
+        for sep in ("_", "-"):
+            if sep in locale:
+                return locale.split(sep)[0].lower()
+        return locale.lower() if locale else None
+    except Exception:
+        return None
+
+
+def _inject_markers_into_excerpt(
+    excerpt_text: str,
+    excerpt_start: int,
+    excerpt_end: int,
+    sel_start: int,
+    sel_end: int,
+    prefix: str,
+    suffix: str,
+) -> str:
+    """Inject [SELECTION_START] and [SELECTION_END] at character positions relative to excerpt.
+    excerpt_start/excerpt_end are the document character range this excerpt covers.
+    sel_start/sel_end are the selection/cursor range in document coordinates."""
+    if sel_start >= excerpt_end or sel_end <= excerpt_start:
+        # Selection does not overlap this excerpt (or both markers in same position outside)
+        return prefix + excerpt_text + suffix
+    # Map to excerpt-relative indices
+    local_start = max(0, sel_start - excerpt_start)
+    local_end = min(len(excerpt_text), sel_end - excerpt_start)
+    # Build result with markers inserted (order: text before start, START, text between, END, text after)
+    before = excerpt_text[:local_start]
+    between = excerpt_text[local_start:local_end]
+    after = excerpt_text[local_end:]
+    out = prefix + before + "[SELECTION_START]" + between + "[SELECTION_END]" + after + suffix
+    return out
+
+
+# Resolver-only TreeService used when plugin.main has not registered writer_tree
+# (unit tests, and any call before WriterModule.initialize). One instance so
+# repeated misses do not subscribe a new cache listener each time.
+_FALLBACK_WRITER_TREE: Any = None
+
+
+def _unresolved_locator(locator: str) -> ToolExecutionError:
+    """Locator string that is not ``type:value``."""
+    return ToolExecutionError(
+        "Cannot resolve locator '%s'. Use type:value such as paragraph:N, "
+        "heading:1.2, chapter_number:3.1, bookmark:NAME, heading_text:Title, "
+        "section:NAME, or page:N." % locator
+    )
+
+
+def _writer_tree_service() -> Any:
+    """Return the process TreeService, or one resolver-only fallback.
+
+    The registered service shares the heading-tree cache and bookmark map
+    with navigation. The fallback exists so a locator still resolves when
+    this function runs outside bootstrap (pytest, or before the writer
+    module loads). Its document service is a plain DocumentService.
+    """
+    import sys
+
+    global _FALLBACK_WRITER_TREE
+
+    main_mod = sys.modules.get("plugin.main")
+    services = getattr(main_mod, "_services", None) if main_mod is not None else None
+    if services is not None:
+        getter = getattr(services, "get", None)
+        if callable(getter):
+            tree = getter("writer_tree")
+            if tree is not None and hasattr(tree, "resolve_writer_locator"):
+                return tree
+
+    if _FALLBACK_WRITER_TREE is not None:
+        return _FALLBACK_WRITER_TREE
+
+    from types import SimpleNamespace
+
+    from plugin.writer.tree import TreeService
+
+    class _Events:
+        def subscribe(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+    class _Bookmarks:
+        def get_mcp_bookmark_map(self, _doc: Any) -> dict[Any, Any]:
+            return {}
+
+    _FALLBACK_WRITER_TREE = TreeService(
+        SimpleNamespace(
+            document=DocumentService(),
+            writer_bookmarks=_Bookmarks(),
+            events=_Events(),
+        )
+    )
+    return _FALLBACK_WRITER_TREE
+
+
+def _dispatch_writer_locator(model: Any, loc_type: str, loc_value: str) -> dict[str, Any]:
+    """Resolve a locator ``TreeService.resolve_writer_locator`` owns.
+
+    ``heading_text:``, ``section:``, ``page:``, and a bookmark name
+    that is missing or already deleted fall out of
+    ``resolve_locator`` as paragraph 0. A bookmark that still has a
+    name but whose anchor cannot be placed does the same when the
+    live ``bookmark:`` branch returns ``find_paragraph_for_range``'s
+    fallback 0. Navigation, ``get_page_objects``, and
+    ``clone_heading_block`` then change the first paragraph and
+    return success. ``TreeService.resolve_writer_locator`` already
+    rejects a missing name. Every ``bookmark:`` goes through that
+    resolver, which rejects an anchor that does not land on a
+    paragraph. ``ValueError`` (``page:abc`` fails ``int()`` before
+    the resolver's own error) becomes ``ToolExecutionError``
+    because the tool registry re-raises ``ValueError`` as a
+    programmer error. A result with no paragraph index is an
+    error, not paragraph 0.
+    """
+    tree = _writer_tree_service()
+    try:
+        resolved = tree.resolve_writer_locator(model, loc_type, loc_value)
+    except ToolExecutionError:
+        raise
+    except ValueError as exc:
+        raise ToolExecutionError("Cannot resolve %s:%s — %s" % (loc_type, loc_value, exc)) from exc
+    if not isinstance(resolved, dict) or not isinstance(resolved.get("para_index"), int):
+        raise ToolExecutionError("Cannot resolve %s:%s" % (loc_type, loc_value))
+    return resolved
+
+
+def resolve_locator(model: Any, locator: str) -> dict[str, Any]:
+    """Resolve a locator string to a paragraph index.
+
+    ``paragraph:``, ``heading:`` (sibling-ordinal), and ``chapter_number:``
+    (Chapter Numbering paint label) are resolved here. Every ``bookmark:``
+    goes to ``TreeService.resolve_writer_locator``, including a name that
+    still exists. ``heading_text:``, ``section:``, ``page:``, and any other
+    writer locator go there too. A missing bookmark, or a bookmark whose
+    anchor does not land on a paragraph, raises ``ToolExecutionError``.
+    """
+    loc_type, sep, loc_value = locator.partition(":")
+    if not sep or not loc_type:
+        raise _unresolved_locator(locator)
+
+    if loc_type == "paragraph":
+        try:
+            return {"para_index": int(loc_value)}
+        except (TypeError, ValueError) as exc:
+            raise ToolExecutionError("Cannot resolve paragraph:%s" % loc_value) from exc
+
+    if loc_type == "heading":
+        try:
+            parts = [int(p) for p in loc_value.split(".")]
+        except (TypeError, ValueError) as exc:
+            raise ToolExecutionError(
+                "Cannot resolve heading:%s — use a sibling-ordinal path such as heading:1.2."
+                % loc_value
+            ) from exc
+
+        tree = _text_helpers.build_heading_tree(model)
+        node: _text_helpers.HeadingTreeNode = tree
+        for part in parts:
+            children = node["children"]
+            if 1 <= part <= len(children):
+                node = children[part - 1]
+            else:
+                break
+        return {"para_index": node["para_index"]}
+
+    if loc_type == "chapter_number":
+        tree = _text_helpers.build_heading_tree(model)
+        found = _text_helpers.find_heading_by_chapter_number(tree, loc_value)
+        if found is None:
+            raise ToolExecutionError(
+                "No heading with chapter_number:%s. Chapter Numbering may be off "
+                "(writer_tree omits chapter_number when the outline label is empty), "
+                "or no heading has that label. heading: is the sibling-ordinal path, "
+                "not the chapter label." % loc_value
+            )
+        return {"para_index": found["para_index"]}
+
+    # bookmark: is not resolved here. The old branch returned
+    # find_paragraph_for_range's fallback 0 when the anchor could not be
+    # placed, so a stale name still navigated to the first paragraph.
+    # TreeService.resolve_writer_locator rejects that anchor.
+    return _dispatch_writer_locator(model, loc_type, loc_value)
+
+
+def is_cacheable_doc_key(key: str) -> bool:
+    """False for the empty-identity sentinel — do not store or attach listeners."""
+    return bool(key) and key != UNKNOWN_DOC_KEY
+
+
+def _compute_doc_key(doc: Any) -> str:
+    """uid:<RuntimeUID> then url:<normalized>; never id(doc)."""
+    if doc is None:
+        return UNKNOWN_DOC_KEY
+    uid = get_runtime_uid(doc)
+    if uid:
+        return "uid:%s" % uid
+    try:
+        raw = doc.getURL()
+    except Exception:
+        raw = ""
+    url = normalize_doc_url(raw) if isinstance(raw, str) else ""
+    if url:
+        return "url:%s" % url
+    return UNKNOWN_DOC_KEY
+
+
+def _emit_cache_invalidated(*, doc: Any | None = None, key: str | None = None) -> None:
+    from plugin.framework.event_bus import get_event_bus
+
+    payload: dict[str, Any] = {}
+    if key is not None:
+        payload["key"] = key
+    if doc is not None:
+        payload["doc"] = doc
+    get_event_bus().emit("document:cache_invalidated", **payload)
+
+
+class _CacheListenerPair:
+    key: str
+    modify: Any
+    unload: Any
+    _model: Any
+
+    def __init__(self, key: str, modify: Any, unload: Any, model: Any) -> None:
+        self.key = key
+        self.modify = modify
+        self.unload = unload
+        try:
+            self._model_ref: Any = weakref.ref(model)
+        except TypeError:
+            self._model_ref = None
+            self._model = model
+
+    def model(self) -> Any:
+        if self._model_ref is not None:
+            return self._model_ref()
+        return getattr(self, "_model", None)
+
+
+class _CacheModifyListener:
+    """Drops Writer tree / proximity / FTS caches when the model changes.
+
+    PyUNO wrappers are not stable identity (see doc_key). Store the key at
+    attach so disposing() can emit without calling getURL() / RuntimeUID on a
+    half-dead model.
+    """
+
+    _doc_key_val: str
+
+    def __init__(self, key: str) -> None:
+        self._doc_key_val = key
+
+    def modified(self, aEvent: Any) -> None:  # noqa: N802, N803 -- UNO signature
+        try:
+            if _IGNORE_DEPTH > 0:
+                return
+            model = getattr(aEvent, "Source", None)
+            _emit_cache_invalidated(doc=model)
+        except Exception:
+            log.debug("cache invalidate modify handler failed", exc_info=True)
+
+    def disposing(self, Source: Any) -> None:  # noqa: N802, N803 -- UNO signature
+        _teardown_cache_listener(self._doc_key_val, owner_modify=self)
+
+
+class _CacheUnloadListener:
+    _doc_key_val: str
+
+    def __init__(self, key: str) -> None:
+        self._doc_key_val = key
+
+    def documentEventOccured(self, Event: Any) -> None:  # noqa: N802, N803 -- UNO spelling
+        try:
+            name = getattr(Event, "EventName", "") or ""
+            if name == "OnUnload":
+                _teardown_cache_listener(self._doc_key_val, owner_unload=self)
+        except Exception:
+            log.debug("cache invalidate unload handler failed", exc_info=True)
+
+    def disposing(self, Source: Any) -> None:  # noqa: N802, N803 -- UNO signature
+        _teardown_cache_listener(self._doc_key_val, owner_unload=self)
+
+
+def _teardown_cache_listener(key: str, owner_modify: Any | None = None, owner_unload: Any | None = None) -> None:
+    pair = _CACHE_LISTENERS.get(key)
+    if pair is None:
+        return
+    # Recycled RuntimeUID: a late disposing() from the old listener must not
+    # evict the newer pair (review_toolbar._ReviewModifyListener).
+    if owner_modify is not None and pair.modify is not owner_modify:
+        return
+    if owner_unload is not None and pair.unload is not owner_unload:
+        return
+    popped = _CACHE_LISTENERS.pop(key, None)
+    if popped is None:
+        return
+    _emit_cache_invalidated(key=key)
+    model = popped.model()
+    if model is None:
+        return
+    try:
+        if hasattr(model, "removeModifyListener"):
+            model.removeModifyListener(popped.modify)
+    except Exception:
+        log.debug("cache modify listener removal failed", exc_info=True)
+    try:
+        if hasattr(model, "removeDocumentEventListener"):
+            model.removeDocumentEventListener(popped.unload)
+    except Exception:
+        log.debug("cache unload listener removal failed", exc_info=True)
+
+
+def _uno_listener(logic_cls: Any, iface: Any, key: str) -> Any:
+    """Attach-time UNO subclass so module import stays soffice-free."""
+    if not _HAVE_UNO_LISTENERS:
+        return logic_cls(key)
+    base = cast("Any", _unohelper).Base
+    cls = type("_UnoCacheListener", (base, iface, logic_cls), {})
+    return cls(key)
+
+
+def _ensure_cache_listener(doc: Any, key: str) -> None:
+    if key in _CACHE_LISTENERS:
+        return
+    can_modify = hasattr(doc, "addModifyListener")
+    can_unload = hasattr(doc, "addDocumentEventListener")
+    if not can_modify and not can_unload:
+        return
+    modify = _uno_listener(_CacheModifyListener, _XModifyListener, key)
+    unload = _uno_listener(_CacheUnloadListener, _XDocumentEventListener, key)
+    try:
+        if can_modify:
+            doc.addModifyListener(modify)
+        if can_unload:
+            doc.addDocumentEventListener(unload)
+    except Exception:
+        log.debug("cache listener registration failed", exc_info=True)
+        try:
+            if can_modify:
+                doc.removeModifyListener(modify)
+        except Exception:
+            pass
+        try:
+            if can_unload:
+                doc.removeDocumentEventListener(unload)
+        except Exception:
+            pass
+        return
+    _CACHE_LISTENERS[key] = _CacheListenerPair(key, modify, unload, doc)
+
+
+class DocumentService(ServiceBase):
+    name: str | None = "document"
+
+    def initialize(self, ctx: Any) -> None:
+        pass
+
+    def get_active_document(self) -> Any:
+        return get_active_document()
+
+    def resolve_document_by_url(self, url: str) -> Any:
+        """Resolve (doc, doc_type) by document URL; (None, None) if not found. Main-thread only."""
+        return _resolve_document_by_url(get_ctx(), url)
+
+    def detect_doc_type(self, doc: Any) -> str:
+        doc_type = _doc_type.get_document_type(doc)
+        if doc_type == _doc_type.DocumentType.CALC:
+            return "calc"
+        if doc_type in (_doc_type.DocumentType.DRAW, _doc_type.DocumentType.IMPRESS):
+            return "draw"
+        return "writer"
+
+    def open_documents(self) -> list[Any]:
+        """Every open real document (Start Center excluded), in desktop order. Main-thread only."""
+        from plugin.framework.uno_context import get_desktop
+
+        docs = []
+        try:
+            desktop = get_desktop()
+            comps = desktop.getComponents() if desktop is not None else None
+            enum = comps.createEnumeration() if comps else None
+            while enum and enum.hasMoreElements():
+                doc = enum.nextElement()
+                try:
+                    if doc.supportsService("com.sun.star.document.OfficeDocument"):
+                        docs.append(doc)
+                except Exception:
+                    continue
+        except Exception:
+            log.debug("open_documents failed", exc_info=True)
+        return docs
+
+    def open_documents_by_type(self) -> dict[str, Any]:
+        """``{doc_type: first open document of that type}``. Main-thread only.
+
+        ONE document per type -- right for the tool catalog, which is keyed by type,
+        and wrong for anything that needs to know how many documents are open (use
+        open_documents for that).
+
+        tools/list used to be filtered by the *active* document alone, so with a
+        spreadsheet in front the Writer tools vanished from the catalog even
+        though a Writer document was open beside it -- the single most reported
+        WriterAgent failure ("no editing tools in this session"). The tools all
+        accept ``document_url``, so what is open, not what has focus, is the
+        honest basis for the catalog.
+        """
+        found: dict[str, Any] = {}
+        for doc in self.open_documents():
+            try:
+                found.setdefault(self.detect_doc_type(doc), doc)
+            except Exception:
+                continue
+        return found
+
+    def is_writer(self, doc: Any) -> bool:
+        return _doc_type.is_writer(doc)
+
+    def is_calc(self, doc: Any) -> bool:
+        return _doc_type.is_calc(doc)
+
+    def is_draw(self, doc: Any) -> bool:
+        return _doc_type.is_draw(doc)
+
+    def get_full_text(self, doc: Any, max_chars: int = 8000) -> str:
+        return get_full_document_text(doc, max_chars)
+
+    def get_document_length(self, doc: Any) -> int:
+        return _text_helpers.get_document_length(doc)
+
+    def get_document_context_for_chat(
+        self,
+        doc: Any,
+        max_context: int = CHAT_DOCUMENT_CONTEXT_MAX_CHARS,
+        include_end: bool = True,
+        include_selection: bool = True,
+    ) -> str:
+        return get_document_context_for_chat(doc, max_context, include_end, include_selection, get_ctx())
+
+    def get_page_for_paragraph(self, model: Any, para_index: int) -> int:
+        """Return page number for a paragraph by index.
+
+        Uses with_view_cursor_left_body_locked to leave nested XText and prevent visible viewport jumping.
+        """
+        # What was wrong: Hand-rolled cursor save used doc.getText().createTextCursorByRange(vc.getStart()),
+        # which raised RuntimeException ("End of content node doesn't have the proper start node")
+        # when the view cursor was located inside a table cell or frame (#1422). The exception was caught
+        # and returned fallback 1. It also restored the cursor before unlocking controllers.
+        # How it happened: An outdated cursor-save pattern remained in document_helpers.py while structural.py
+        # had already solved nested XText handling.
+        # Why this change: Uses _text_helpers.with_view_cursor_left_body_locked to cleanly save/restore
+        # the cursor across nested XText, and raises ToolExecutionError when paragraph or page resolution fails.
+        check_disposed(model, "Document Model")
+        element, _ = self.find_paragraph_element(model, para_index)
+        if element is None:
+            raise ToolExecutionError("Paragraph index %d not found in document" % para_index)
+
+        get_anchor = getattr(element, "getAnchor", None)
+        anchor = get_anchor() if callable(get_anchor) else element
+
+        controller = safe_call(model.getCurrentController, "Get current controller")
+        vc = safe_call(controller.getViewCursor, "Get view cursor")
+
+        def _resolve_page() -> int:
+            safe_call(vc.gotoRange, "View cursor gotoRange", anchor, False)
+            page = safe_call(vc.getPage, "Get page")
+            if page == 0:
+                # Layout stall for tables/frames under lockControllers.
+                has_locked = getattr(model, "hasControllersLocked", None)
+                was_locked = has_locked() if callable(has_locked) else True
+                if was_locked:
+                    safe_call(model.unlockControllers, "Unlock controllers")
+                try:
+                    safe_call(vc.gotoRange, "View cursor gotoRange", anchor, False)
+                    page = safe_call(vc.getPage, "Get page")
+                finally:
+                    if was_locked:
+                        safe_call(model.lockControllers, "Lock controllers")
+            if page == 0:
+                raise ToolExecutionError(
+                    "Cannot resolve page for paragraph %d: getPage returned 0" % para_index
+                )
+            return page
+
+        return _text_helpers.with_view_cursor_left_body_locked(model, vc, _resolve_page)
+
+    def get_page_count(self, model: Any) -> int:
+        """Return page count of a Writer document."""
+        # What was wrong: Hand-rolled cursor save used doc.getText().createTextCursorByRange(vc.getStart()),
+        # which threw RuntimeException when vc sat in a table cell or frame, causing get_page_count to return 0.
+        # How it happened: Same outdated cursor save pattern as get_page_for_paragraph.
+        # Why this change: Uses with_view_cursor_left_body_locked while maintaining soft-fail 0 for tree/outline callers.
+        try:
+            check_disposed(model, "Document Model")
+            controller = safe_call(model.getCurrentController, "Get current controller")
+            vc = safe_call(controller.getViewCursor, "Get view cursor")
+
+            def _get_count() -> int:
+                safe_call(vc.jumpToLastPage, "Jump to last page")
+                return safe_call(vc.getPage, "Get page")
+
+            return _text_helpers.with_view_cursor_left_body_locked(model, vc, _get_count)
+        except (UnoObjectError, ToolExecutionError):
+            logging.getLogger(__name__).exception("get_page_count error")
+            return 0
+
+    def doc_key(self, doc: Any) -> str:
+        """Stable cache key for one open document.
+
+        PyUNO hands out a new Python wrapper on almost every lookup of the same
+        UNO document. Keying caches with ``id(doc)`` therefore almost never
+        hits; after GC, CPython can reuse that id and a lookup can return
+        another document's tree (or a disposed one). Nelson mcp ``039ade49`` /
+        ``e9d3aa36`` (#2642). RuntimeUID (then URL) matches MCP
+        ``_resolve_mcp_doc_key``. Empty both → ``UNKNOWN_DOC_KEY`` (do not
+        cache). First call lazily attaches one modify + OnUnload listener.
+        """
+        key = _compute_doc_key(doc)
+        if is_cacheable_doc_key(key):
+            _ensure_cache_listener(doc, key)
+        return key
+
+    @contextmanager
+    def ignore_cache_invalidation(self) -> Generator[None, None, None]:
+        """Suppress modify-driven cache drops (reentrant).
+
+        Item 4 wraps ``_mcp_`` bookmark insert/strip so those mutations do not
+        thrash the heading tree. Nested ``with`` is required (strip then
+        restore during save). Queued modifies are dropped, not flushed.
+        """
+        global _IGNORE_DEPTH
+        _IGNORE_DEPTH += 1
+        try:
+            yield
+        finally:
+            _IGNORE_DEPTH -= 1
+
+    def get_paragraph_ranges(self, doc: Any) -> list[Any]:
+        """Return list of top-level paragraph elements."""
+        return _get_paragraph_ranges(doc)
+
+    def find_paragraph_for_range(self, anchor: Any, para_ranges: list[Any], text_obj: Any = None) -> int:
+        """Return the 0-based paragraph index that contains anchor."""
+        return _find_paragraph_for_range(anchor, para_ranges, text_obj)
+
+    def resolve_locator(self, doc: Any, locator: str) -> dict[str, Any]:
+        """Resolve a locator string to a paragraph index.
+
+        Unresolvable locators raise ``ToolExecutionError``. See module
+        ``resolve_locator``.
+        """
+        return resolve_locator(doc, locator)
+
+    def yield_to_gui(self) -> None:
+        """Yield to the UI event loop (no-op here)."""
+        pass
+
+    def annotate_pages(self, children: Any, doc: Any) -> None:
+        """Annotate tree children with page numbers (no-op here)."""
+        pass
+
+    def find_paragraph_element(self, doc: Any, para_index: int) -> tuple[Any, None]:
+        """Return (paragraph_element, None) for the given index, or (None, None) if out of range."""
+        ranges = _get_paragraph_ranges(doc)
+        if 0 <= para_index < len(ranges):
+            return (ranges[para_index], None)
+        return (None, None)

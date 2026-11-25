@@ -1,0 +1,836 @@
+# WriterAgent - AI Writing Assistant for LibreOffice
+# Copyright (c) 2024 John Balis
+# Copyright (c) 2026 KeithCu (modifications and relicensing)
+# Copyright (c) 2026 LibreCalc AI Assistant (Calc integration features, originally MIT)
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""Writer text / path / selection helpers used by LibrePy without ``document_helpers``.
+
+LibrePy Run Python Script, text analytics, Excel auto-open, and Writer selection
+offsets need linebreak normalization, tracked-deletion reads, heading trees, file
+paths, selection range calculation, and Writer text-slice reads. Those must not
+load ``document_helpers`` → chat context / ``DocumentService``.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+from typing import TYPE_CHECKING, Any, TypedDict
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator, Mapping
+
+import uno
+
+from plugin.doc import doc_type as _doc_type
+from plugin.framework.errors import UnoObjectError, check_disposed, safe_call
+from plugin.framework.thread_guard import main_thread_only
+
+_PARAGRAPH_SERVICE = "com.sun.star.text.Paragraph"
+
+
+def normalize_linebreaks(text: str | None) -> str:
+    """Ensure all linebreaks use \\n (LF).
+
+    Some UNO APIs (especially on Windows) or clipboard paths can return \\r\\n
+    or \\r. This ensures consistent offsets and string length for the LLM.
+    """
+    if text is None:
+        return ""
+    # Normalize \r\n -> \n
+    text = text.replace("\r\n", "\n")
+    # Normalize \n\r (rare but possible) -> \n
+    text = text.replace("\n\r", "\n")
+    # Normalize remaining \r -> \n
+    text = text.replace("\r", "\n")
+    return text
+
+
+# goRight(nCount, bExpand) takes short; max 32767 per call
+_GO_RIGHT_CHUNK = 8192
+
+
+def _writer_char_count(model: Any) -> int:
+    """Length of the Writer body in cursor steps: the space every offset here uses
+    (``get_text_cursor_at_range``, ``get_selection_range``, the chat excerpt reads).
+
+    The ``CharacterCount`` statistic leaves out paragraph breaks
+    and text deleted by pending tracked changes (54 chars read as
+    53; 60 pending edits, 2385 against offsets up to 3404). Adding
+    ``ParagraphCount - 1`` puts the breaks back but not the deleted
+    text, which the cursor still steps over. Callers treat this
+    length as the end of the offset space, so the chat's [DOCUMENT
+    END] excerpt and get_full_writer_text drop the end of the
+    document, and a selection at the end comes back as (length,
+    length). The statistic is not cheap either: after an edit it
+    recomputes (253 ms on a 348k-char body; this walk took 55 ms).
+
+    Future: if huge-document chat feels slow, cache this length (and the visible
+    ``get_document_length`` walk) until the next edit instead of walking every call.
+    """
+    try:
+        text = safe_call(model.getText, "Get document text")
+        cursor = safe_call(text.createTextCursor, "Create text cursor")
+        safe_call(cursor.gotoStart, "Cursor gotoStart", False)
+        count = 0
+        step = _GO_RIGHT_CHUNK
+        while step:
+            probe = safe_call(text.createTextCursorByRange, "Create probe cursor",
+                              safe_call(cursor.getStart, "Cursor getStart"))
+            # A goRight that cannot go the full distance still moves to the end and returns
+            # False, so retry a smaller step from the last position it fully reached.
+            if safe_call(probe.goRight, "Cursor goRight", step, False) is True:
+                cursor = probe
+                count += step
+            else:
+                step //= 2
+        return count
+    except UnoObjectError:
+        logging.getLogger(__name__).exception("_writer_char_count failed")
+        return 0
+
+
+def _char_offset_of_position(model: Any, target_start: Any, doc_len: int) -> int:
+    """Character offset of a UNO text position from document start (no prefix getString())."""
+    if doc_len <= 0:
+        return 0
+    try:
+        text = safe_call(model.getText, "Get document text")
+        cursor = safe_call(text.createTextCursor, "Create text cursor")
+        safe_call(cursor.gotoStart, "Cursor gotoStart", False)
+        offset = 0
+        while offset < doc_len:
+            cmp = safe_call(text.compareRegionStarts, "compareRegionStarts", target_start, safe_call(cursor.getStart, "Cursor getStart"))
+            if cmp == 0:
+                return offset
+            if cmp > 0:
+                if offset == 0:
+                    return 0
+                safe_call(cursor.goLeft, "Cursor goLeft", 1, False)
+                offset -= 1
+                continue
+            step = min(_GO_RIGHT_CHUNK, doc_len - offset)
+            if step <= 0:
+                return offset
+            safe_call(cursor.goRight, "Cursor goRight", step, False)
+            offset += step
+            cmp_after = safe_call(text.compareRegionStarts, "compareRegionStarts", target_start, safe_call(cursor.getStart, "Cursor getStart"))
+            if cmp_after >= 0:
+                while offset > 0 and safe_call(text.compareRegionStarts, "compareRegionStarts", target_start, safe_call(cursor.getStart, "Cursor getStart")) > 0:
+                    safe_call(cursor.goLeft, "Cursor goLeft", 1, False)
+                    offset -= 1
+                while safe_call(text.compareRegionStarts, "compareRegionStarts", target_start, safe_call(cursor.getStart, "Cursor getStart")) < 0 and offset < doc_len:
+                    safe_call(cursor.goRight, "Cursor goRight", 1, False)
+                    offset += 1
+                return offset
+        return doc_len
+    except UnoObjectError:
+        logging.getLogger(__name__).exception("_char_offset_of_position failed")
+        return 0
+
+
+def _get_writer_selection_positions(model: Any) -> tuple[Any, Any, Any] | None:
+    """Return (text, sel_start_pos, sel_end_pos) or None when selection unavailable."""
+    try:
+        check_disposed(model, "Document Model")
+        controller = safe_call(model.getCurrentController, "Get current controller")
+        sel = safe_call(controller.getSelection, "Get selection")
+        sel_count = 0
+        if sel and hasattr(sel, "getCount"):
+            sel_count = safe_call(sel.getCount, "Get selection count")
+        if not sel or sel_count == 0:
+            vc = safe_call(controller.getViewCursor, "Get view cursor")
+            rng = vc
+        else:
+            rng = safe_call(sel.getByIndex, "Get selection by index", 0)
+        if not rng or not hasattr(rng, "getStart") or not hasattr(rng, "getEnd"):
+            return None
+        text = safe_call(rng.getText, "Get range text")
+        return text, safe_call(rng.getStart, "Get range start"), safe_call(rng.getEnd, "Get range end")
+    except UnoObjectError:
+        return None
+
+
+@main_thread_only
+def get_selection_range(model: Any) -> tuple[int, int]:
+    """Return (start_offset, end_offset) character positions into the document.
+    Cursor (no selection) = same start and end. Returns (0, 0) on error or no text range."""
+    try:
+        check_disposed(model, "Document Model")
+        sel_positions = _get_writer_selection_positions(model)
+        if sel_positions is None:
+            return (0, 0)
+        _text, sel_start_pos, sel_end_pos = sel_positions
+        doc_len = _writer_char_count(model)
+        start_offset = _char_offset_of_position(model, sel_start_pos, doc_len)
+        end_offset = _char_offset_of_position(model, sel_end_pos, doc_len)
+        return (start_offset, end_offset)
+    except UnoObjectError:
+        logging.getLogger(__name__).exception("get_selection_range failed")
+        return (0, 0)
+
+
+class _HeadingTreeRequired(TypedDict):
+    level: int
+    text: str
+    para_index: int
+    children: list["HeadingTreeNode"]
+    body_paragraphs: int
+
+
+class HeadingTreeNode(_HeadingTreeRequired, total=False):
+    """Shape of nodes returned by :func:`build_heading_tree` (recursive heading tree).
+
+    Optional ``chapter_number`` (Tools → Chapter Numbering paint label) is set
+    only when present — omit the key when numbering is off. See
+    :func:`chapter_number_from_para`.
+    """
+
+    chapter_number: str
+
+
+def chapter_number_from_para(para: Any) -> str | None:
+    """Read-only chapter / outline label, or ``None`` when numbering is off.
+
+    Authoritative paint label is paragraph ``ListLabelString`` (discussion
+    #876 / LO 25.2.3). ``NumberingStyleName`` can be ``\"Outline\"`` even
+    when Chapter Numbering is off — do not use it as an on/off signal.
+    ``OutlineLevel`` / ``getString()`` never include the label.
+
+    Normalize on emit: strip a trailing ``.`` so Suffix=``\"\"`` and
+    Suffix=``\".\"`` both become locator ``chapter_number:3.1``.
+    """
+    try:
+        raw = str(para.getPropertyValue("ListLabelString") or "").rstrip(".")
+    except Exception:
+        return None
+    return raw or None
+
+
+def apply_chapter_number(node: Any, para: Any) -> None:
+    """Set optional ``chapter_number`` on a heading node; omit the key when off."""
+    label = chapter_number_from_para(para)
+    if label:
+        node["chapter_number"] = label
+
+
+def iter_heading_nodes(node: Mapping[str, Any]) -> Iterator[Mapping[str, Any]]:
+    """Yield heading children in document order (not the synthetic root)."""
+    for child in node.get("children", []):
+        yield child
+        yield from iter_heading_nodes(child)
+
+
+def find_heading_by_chapter_number(tree: Mapping[str, Any], label: str) -> Mapping[str, Any] | None:
+    """Exact match on the emitted ``chapter_number`` field (after normalize).
+
+    Does **not** invent a label from sibling ordinals. ``heading:1.2`` remains
+    the ordinal path; this looks up the paint label only.
+    """
+    want = str(label or "").rstrip(".")
+    if not want:
+        return None
+    for child in iter_heading_nodes(tree):
+        if child.get("chapter_number") == want:
+            return child
+    return None
+
+
+def _portion_type(portion: Any) -> str | None:
+    try:
+        return portion.getPropertyValue("TextPortionType")
+    except Exception:
+        try:
+            return portion.TextPortionType
+        except Exception:
+            return None
+
+
+def _range_is_paragraph(text_range: Any) -> bool:
+    """True when *text_range* is a paragraph: children are portions, not paragraphs.
+
+    ``createEnumeration()`` on a document or multi-para cursor yields paragraphs.
+    On a paragraph ``XTextRange`` it yields text portions (bold runs, redlines).
+    Treating those portions as paragraphs used to inject a ``\\n`` between runs.
+    """
+    try:
+        if text_range.supportsService(_PARAGRAPH_SERVICE):
+            return True
+    except Exception:
+        pass
+    try:
+        enum = text_range.createEnumeration()
+        if not enum.hasMoreElements():
+            return False
+        return _portion_type(enum.nextElement()) is not None
+    except Exception:
+        return False
+
+
+def _visible_portions(
+    para: Any,
+    *,
+    abort_on_portion_error: bool = False,
+    limit: int | None = None,
+    truncated_out: list[int] | None = None,
+) -> Iterator[tuple[Any, str]]:
+    """Yield ``(portion, text)`` for visible text, skipping tracked deletions.
+
+    Shared by ``get_string_without_tracked_deletions`` and html_export paint so
+    an offset taken from the helper string indexes these chunks without drift.
+
+    Paint (``html_export._paint_direct_formatting``) passes
+    ``abort_on_portion_error=True``: a failed ``nextElement`` / portion type
+    would desync character offsets, so the walk stops. The helper continues
+    past a bad portion so later runs can still contribute text.
+
+    When *limit* stops the walk with more portions waiting, *truncated_out*
+    (if given) receives the seen count so the caller can warn.
+    """
+    try:
+        portion_enum = para.createEnumeration()
+    except Exception:
+        return
+    in_delete = False
+    seen = 0
+    while portion_enum.hasMoreElements():
+        if limit is not None and seen >= limit:
+            # Cap hit with more portions waiting — caller can warn that paint is partial.
+            if truncated_out is not None:
+                truncated_out.append(seen)
+            return
+        seen += 1
+        try:
+            portion = portion_enum.nextElement()
+        except Exception:
+            if abort_on_portion_error:
+                return
+            continue
+        portion_type = _portion_type(portion)
+        if portion_type is None:
+            if abort_on_portion_error:
+                return
+            continue
+        if portion_type == "Redline":
+            try:
+                if str(portion.getPropertyValue("RedlineType")) == "Delete":
+                    in_delete = not in_delete
+            except Exception:
+                pass
+            continue
+        if in_delete:
+            continue
+        try:
+            chunk = portion.getString()
+        except Exception:
+            continue
+        if chunk:
+            yield portion, chunk
+
+
+def _paragraph_visible_text(para: Any) -> str:
+    """Visible text of one paragraph via ``_visible_portions``.
+
+    Falls back to ``getString()`` only when the portion enum cannot be opened
+    (same as the old helper). An empty walk after a successful enum is kept
+    empty so tracked-only paragraphs do not re-include deleted text.
+    """
+    chunks = list(_visible_portions(para))
+    if chunks:
+        return "".join(chunk for _unused, chunk in chunks)
+    try:
+        para.createEnumeration()
+    except Exception:
+        try:
+            return para.getString()
+        except Exception:
+            return ""
+    return ""
+
+
+@main_thread_only
+def get_string_without_tracked_deletions(text_range: Any) -> str:
+    """Return *text_range* text while skipping tracked deletions when possible.
+
+    A paragraph (``com.sun.star.text.Paragraph``, or first child has
+    ``TextPortionType``) concatenates visible portions without a mid-``\\n``.
+    A document or multi-paragraph range still joins paragraphs with ``\\n``.
+    """
+    if hasattr(text_range, "_mock_return_value") or type(text_range).__name__ in ("Mock", "MagicMock"):
+        return text_range.getString()
+    try:
+        if _range_is_paragraph(text_range):
+            return _paragraph_visible_text(text_range)
+        para_enum = text_range.createEnumeration()
+    except Exception:
+        return text_range.getString()
+
+    parts: list[str] = []
+    try:
+        first_para = True
+        while para_enum.hasMoreElements():
+            para = para_enum.nextElement()
+            if not first_para:
+                parts.append("\n")
+            first_para = False
+            # Each paragraph's portion enum is independent; Delete start/end
+            # markers for this walk live in that para. Reset is inside
+            # _visible_portions (same as UNO per-paragraph redline markers).
+            parts.append(_paragraph_visible_text(para))
+    except Exception:
+        return text_range.getString()
+
+    return "".join(parts)
+
+
+def normalize_file_url(url: str) -> str:
+    """Repair ``file:/path`` URLs from the old ``urljoin('file:', ...)`` form.
+
+    That join wrongly yields ``file:/home/...`` (two slashes).
+    ``loadComponentFromURL`` and ``fileUrlToSystemPath`` need ``file:///home/...``.
+    Shared by ``get_document_path`` and document-research URL→path.
+    Sandbox / session_manager keep their own stdlib copies (no UNO, Windows).
+    """
+    raw = str(url).strip()
+    if raw.startswith("file:///"):
+        return raw
+    if raw.startswith("file:/") and not raw.startswith("file://"):
+        return "file://" + raw[len("file:") :]
+    return raw
+
+
+@main_thread_only
+def get_document_path(model: Any) -> str | None:
+    """Return the local filesystem path for the document, or None if not a file URL (e.g. untitled)."""
+    try:
+        url = model.getURL()
+        if not url:
+            return None
+        # Legacy urljoin produced file:/path; require file:// after that repair.
+        url = normalize_file_url(str(url))
+        if not url.startswith("file://"):
+            return None
+        return str(uno.fileUrlToSystemPath(url))
+    except Exception as e:
+        logging.getLogger(__name__).debug("get_document_path exception: %s", type(e).__name__)
+        return None
+
+
+@main_thread_only
+def build_heading_tree(model: Any) -> HeadingTreeNode:
+    """Build a hierarchical heading tree. Single pass enumeration."""
+    try:
+        check_disposed(model, "Document Model")
+        text = safe_call(model.getText, "Get document text")
+        enum = safe_call(text.createEnumeration, "Create enumeration")
+        root: HeadingTreeNode = {"level": 0, "text": "root", "para_index": -1, "children": [], "body_paragraphs": 0}
+        stack: list[HeadingTreeNode] = [root]
+        para_index = 0
+
+        while safe_call(enum.hasMoreElements, "Check more elements"):
+            element = safe_call(enum.nextElement, "Get next element")
+            if safe_call(element.supportsService, "Check supportsService Paragraph", "com.sun.star.text.Paragraph"):
+                outline_level = 0
+                try:
+                    outline_level = safe_call(element.getPropertyValue, "Get OutlineLevel", "OutlineLevel")
+                except UnoObjectError as e:
+                    logging.getLogger(__name__).debug("build_heading_tree could not get OutlineLevel: %s", e)
+
+                if isinstance(outline_level, int) and outline_level > 0:
+                    while len(stack) > 1 and int(stack[-1]["level"]) >= outline_level:
+                        stack.pop()
+                    node: HeadingTreeNode = {
+                        "level": outline_level,
+                        "text": safe_call(element.getString, "Get paragraph string"),
+                        "para_index": para_index,
+                        "children": [],
+                        "body_paragraphs": 0,
+                    }
+                    # OutlineLevel > 0 only — list-item ListLabelString is not a chapter label.
+                    apply_chapter_number(node, element)
+                    stack[-1]["children"].append(node)
+                    stack.append(node)
+                else:
+                    stack[-1]["body_paragraphs"] += 1
+            elif safe_call(element.supportsService, "Check supportsService TextTable", "com.sun.star.text.TextTable"):
+                stack[-1]["body_paragraphs"] += 1
+            para_index += 1
+        return root
+    except UnoObjectError:
+        logging.getLogger(__name__).exception("build_heading_tree error")
+        return {"level": 0, "text": "root", "para_index": -1, "children": [], "body_paragraphs": 0}
+
+
+@main_thread_only
+def collect_tracked_changes(text_range: Any, max_per_change: int = 300, max_changes: int = 100) -> list[dict[str, str]]:
+    """Walk text portions and collect tracked insertions/deletions WITH their text, so a reader can
+    see what is pending and that it awaits the user's review (rather than the default read, which
+    hides deletions and gives no hint that changes are pending).
+
+    Returns a list of ``{"type": "insertion"|"deletion", "text": str}`` in document order. Best-effort:
+    returns ``[]`` on any failure. Mirrors get_string_without_tracked_deletions' portion walk, but also
+    toggles on Insert redlines and buffers the text of each change instead of dropping deletions."""
+    out: list[dict[str, str]] = []
+    if hasattr(text_range, "_mock_return_value") or type(text_range).__name__ in ("Mock", "MagicMock"):
+        return out
+    try:
+        para_enum = text_range.createEnumeration()
+    except Exception:
+        return out
+
+    # Insert/Delete redlines can continue across paragraph boundaries, so these
+    # toggles follow document order rather than resetting each paragraph.
+    in_delete = False
+    in_insert = False
+    del_buf: list[str] = []
+    ins_buf: list[str] = []
+
+    def _flush(buf: list[str], kind: str) -> None:
+        if buf and len(out) < max_changes:
+            out.append({"type": kind, "text": "".join(buf)[:max_per_change]})
+        buf.clear()
+
+    try:
+        while para_enum.hasMoreElements() and len(out) < max_changes:
+            para = para_enum.nextElement()
+            try:
+                portion_enum = para.createEnumeration()
+            except Exception:
+                continue
+            while portion_enum.hasMoreElements():
+                portion = portion_enum.nextElement()
+                try:
+                    try:
+                        ptype = portion.getPropertyValue("TextPortionType")
+                    except Exception:
+                        ptype = portion.TextPortionType
+                except Exception:
+                    continue
+
+                if ptype == "Redline":
+                    try:
+                        rtype = str(portion.getPropertyValue("RedlineType"))
+                    except Exception:
+                        rtype = ""
+                    if rtype == "Delete":
+                        if in_delete:
+                            _flush(del_buf, "deletion")
+                        in_delete = not in_delete
+                    elif rtype == "Insert":
+                        if in_insert:
+                            _flush(ins_buf, "insertion")
+                        in_insert = not in_insert
+                    continue
+
+                try:
+                    chunk = portion.getString()
+                except Exception:
+                    chunk = ""
+                if not chunk:
+                    continue
+                if in_delete:
+                    del_buf.append(chunk)
+                elif in_insert:
+                    ins_buf.append(chunk)
+        _flush(del_buf, "deletion")
+        _flush(ins_buf, "insertion")
+    except Exception:
+        return out
+    return out
+
+
+@main_thread_only
+def get_selection_text(model: Any) -> str | None:
+    """Return the selected text or None if selection is empty/unavailable/fails. Handles Writer, Calc, Draw."""
+    try:
+        check_disposed(model, "Document Model")
+        controller = safe_call(model.getCurrentController, "Get current controller")
+        if not controller:
+            return None
+        check_disposed(controller, "Controller")
+
+        doc_type = _doc_type.get_document_type(model)
+
+        if doc_type == _doc_type.DocumentType.WRITER:
+            sel = safe_call(controller.getSelection, "Get selection")
+            sel_count = 0
+            if sel and hasattr(sel, "getCount"):
+                sel_count = safe_call(sel.getCount, "Get selection count")
+            if not sel or sel_count == 0:
+                vc = safe_call(controller.getViewCursor, "Get view cursor")
+                if vc:
+                    check_disposed(vc, "View Cursor")
+                    return safe_call(vc.getString, "Get view cursor string")
+            else:
+                rng = safe_call(sel.getByIndex, "Get selection by index", 0)
+                if rng:
+                    check_disposed(rng, "Selection Range")
+                    return safe_call(rng.getString, "Get selection string")
+        elif doc_type == _doc_type.DocumentType.CALC:
+            selection = safe_call(controller.getSelection, "Get selection")
+            if selection:
+                if hasattr(selection, "getString"):
+                    return safe_call(selection.getString, "Get selection string")
+        elif doc_type in (_doc_type.DocumentType.DRAW, _doc_type.DocumentType.IMPRESS):
+            selection = safe_call(controller.getSelection, "Get selection")
+            if selection and hasattr(selection, "getCount"):
+                count = safe_call(selection.getCount, "Get selection count")
+                parts = []
+                for i in range(count):
+                    shape = safe_call(selection.getByIndex, "Get selection shape", i)
+                    if shape and hasattr(shape, "getString"):
+                        parts.append(safe_call(shape.getString, "Get shape string"))
+                if parts:
+                    return "\n".join(parts)
+    except Exception:
+        pass
+    return None
+
+
+@main_thread_only
+def get_document_end(model: Any, max_chars: int = 4000) -> str:
+    """Get the last max_chars of the document."""
+    try:
+        check_disposed(model, "Document Model")
+        text = safe_call(model.getText, "Get document text")
+        cursor = safe_call(text.createTextCursor, "Create text cursor")
+        safe_call(cursor.gotoEnd, "Cursor gotoEnd", False)
+        safe_call(cursor.gotoStart, "Cursor gotoStart", True)  # expand backward to select from start to end
+        full = get_string_without_tracked_deletions(cursor)
+        if len(full) <= max_chars:
+            return full
+        return full[-max_chars:]
+    except UnoObjectError:
+        logging.getLogger(__name__).exception("get_document_end failed")
+        return ""
+
+
+def _read_writer_text_slice(model: Any, start_offset: int, length: int) -> str:  # pyright: ignore[reportUnusedFunction]
+    """Read up to *length* characters from *start_offset* without loading the full document.
+
+    Used by ``document_helpers.get_document_context_for_chat`` (Writer excerpts).
+    """
+    if length <= 0:
+        return ""
+    end_offset = start_offset + length
+    cursor = get_text_cursor_at_range(model, start_offset, end_offset)
+    if cursor is None:
+        return ""
+    # cursor.getString() concatenates tracked deletions as plain text; enumerate portions instead.
+    return normalize_linebreaks(get_string_without_tracked_deletions(cursor))
+
+
+@main_thread_only
+def get_full_writer_text(model: Any, max_chars: int) -> str:
+    """Prefix of Writer body text, truncated. Hides tracked deletions."""
+    doc_len = _writer_char_count(model)
+    take = min(doc_len, max_chars)
+    excerpt = _read_writer_text_slice(model, 0, take)
+    if doc_len > max_chars:
+        excerpt += "\n\n[... document truncated ...]"
+    return excerpt
+
+
+def _writer_excerpt_overlaps_selection(
+    model: Any,
+    excerpt_start: int,
+    excerpt_end: int,
+    sel_start_pos: Any,
+    sel_end_pos: Any,
+) -> bool:
+    """True when selection UNO range overlaps [excerpt_start, excerpt_end) character window."""
+    exc_cursor = get_text_cursor_at_range(model, excerpt_start, excerpt_end)
+    if exc_cursor is None:
+        return False
+    text = safe_call(model.getText, "Get document text")
+    exc_start = safe_call(exc_cursor.getStart, "Excerpt getStart")
+    exc_end = safe_call(exc_cursor.getEnd, "Excerpt getEnd")
+    if safe_call(text.compareRegionStarts, "compareRegionStarts sel_end exc_start", sel_end_pos, exc_start) > 0:
+        return False
+    if safe_call(text.compareRegionStarts, "compareRegionStarts exc_end sel_start", exc_end, sel_start_pos) > 0:
+        return False
+    return True
+
+
+def _writer_selection_overlaps_windows(  # pyright: ignore[reportUnusedFunction]
+    model: Any,
+    windows: list[tuple[int, int]],
+    sel_start_pos: Any,
+    sel_end_pos: Any,
+) -> bool:
+    for win_start, win_end in windows:
+        if _writer_excerpt_overlaps_selection(model, win_start, win_end, sel_start_pos, sel_end_pos):
+            return True
+    return False
+
+
+@main_thread_only
+def get_document_length(model: Any) -> int:
+    """Return total character length of the document. Returns 0 on error.
+
+    Writer: the length of the visible text (pending tracked deletions hidden, paragraph breaks
+    counted, fields and footnote numbers as shown), read with the same helper
+    get_document_content scope='range' counts its offsets with. It was the ``CharacterCount``
+    statistic, which leaves out the breaks and the deleted text, so a range read near the end
+    was cut short ("o dan"). Cursor steps minus the deleted text is no substitute: a field or
+    footnote anchor is one step but several characters (314 against 324 on 12 footnotes).
+    """
+    try:
+        check_disposed(model, "Document Model")
+        if _doc_type.get_document_type(model) == _doc_type.DocumentType.WRITER:
+            body = safe_call(model.getText, "Get document text")
+            whole = safe_call(body.createTextCursor, "Create text cursor")
+            safe_call(whole.gotoStart, "Cursor gotoStart", False)
+            safe_call(whole.gotoEnd, "Cursor gotoEnd", True)
+            return len(normalize_linebreaks(get_string_without_tracked_deletions(whole)))
+        text = safe_call(model.getText, "Get document text")
+        cursor = safe_call(text.createTextCursor, "Create text cursor")
+        safe_call(cursor.gotoStart, "Cursor gotoStart", False)
+        safe_call(cursor.gotoEnd, "Cursor gotoEnd", True)
+        length = len(normalize_linebreaks(safe_call(cursor.getString, "Cursor getString")))
+        return length
+    except UnoObjectError:
+        logging.getLogger(__name__).exception("get_document_length failed")
+        return 0
+
+
+def clone_text_range(text_range: Any) -> Any:
+    """Clone *text_range* via its own XText (nested table/frame safe).
+
+    ``doc.getText().createTextCursorByRange(range)`` raises UNO
+    RuntimeException ("End of content node doesn't have the proper start node")
+    when the range lives in a table cell or frame. The range's XText is the
+    cell, frame, or body that actually owns it.
+    """
+    return text_range.getText().createTextCursorByRange(text_range)
+
+
+def with_view_cursor_left_body_locked(doc: Any, vc: Any, action_fn: Any) -> Any:
+    """Leave nested XText, lock for the action, unlock before restore.
+
+    What was wrong: Hand-rolled cursor save/lock in get_page_for_paragraph and
+    get_page_count used doc.getText().createTextCursorByRange(vc.getStart())
+    which raised RuntimeException ("End of content node doesn't have the proper
+    start node") when vc sat inside a table cell or text frame, aborting page
+    resolution and falling back to page 1 (#1422). It also called gotoRange
+    before unlockControllers(), which fails for nested cell targets.
+    How it happened: structural.py previously implemented _with_left_body_locked
+    for page scans, but document_helpers.py retained an outdated duplicate.
+    Why this change: Centralizes the leave-body, lock, unlock, restore sequence
+    into one shared, LibrePy-safe helper for all view-cursor walking operations.
+    """
+    saved = None
+    try:
+        # Nested XText (table cell / frame): body getText() cannot clone this range.
+        saved = clone_text_range(vc)
+    except Exception:
+        pass
+    in_body = False
+    try:
+        vc.gotoRange(doc.getText().getStart(), False)
+        in_body = True
+    except Exception:
+        pass
+    if in_body:
+        doc.lockControllers()
+    try:
+        return action_fn()
+    finally:
+        if in_body:
+            doc.unlockControllers()
+        if saved is not None:
+            try:
+                vc.gotoRange(saved, False)
+            except Exception:
+                pass
+
+
+@main_thread_only
+def get_text_cursor_at_range(model: Any, start_offset: int, end_offset: int) -> Any:
+    """Return a text cursor that selects the character range [start_offset, end_offset).
+    The cursor is positioned at start and expanded to end so caller can setString('') and insert.
+    goRight is used in chunks because UNO's goRight takes short (max 32767).
+    Returns None on error or invalid range."""
+    try:
+        check_disposed(model, "Document Model")
+        # Offsets are not clamped to get_document_length(). For Writer
+        # that is the CharacterCount statistic -- it leaves out paragraph
+        # breaks and tracked deletions, while offsets
+        # (search_in_document return_offsets, getString) count both. On
+        # a long document the range is clamped past its real end and
+        # set_selection selects nothing (relato #37). No clamp is needed
+        # at the end: goRight stops at the end of the text on its own.
+        start_offset = max(0, start_offset)
+        end_offset = max(0, end_offset)
+        if start_offset > end_offset:
+            start_offset, end_offset = end_offset, start_offset
+        text = safe_call(model.getText, "Get document text")
+        cursor = safe_call(text.createTextCursor, "Create text cursor")
+        safe_call(cursor.gotoStart, "Cursor gotoStart", False)
+        # Move to start_offset in chunks. A goRight that runs out of text stops at the end and
+        # returns False: stop there, or an offset like 10**12 runs millions of UNO calls.
+        remaining = start_offset
+        while remaining > 0:
+            n = min(remaining, _GO_RIGHT_CHUNK)
+            if safe_call(cursor.goRight, "Cursor goRight", n, False) is False:
+                return cursor
+            remaining -= n
+        # Expand selection by (end_offset - start_offset)
+        remaining = end_offset - start_offset
+        while remaining > 0:
+            n = min(remaining, _GO_RIGHT_CHUNK)
+            if safe_call(cursor.goRight, "Cursor goRight", n, True) is False:
+                break
+            remaining -= n
+        return cursor
+    except UnoObjectError:
+        logging.getLogger(__name__).exception("get_text_cursor_at_range failed")
+        return None
+
+
+# ast_source_offset splits lines on \r\n, \r, or \n, matching
+# Python AST line numbering. str.splitlines() also splits on form
+# feed (\x0c), vertical tab (\x0b), U+2028, U+2029, and other
+# Unicode breaks the lexer does not. Line-start offsets are
+# precomputed for O(1) random-access lookups.
+_AST_LINE_BREAK_RE = re.compile(r"\r\n|\r|\n")
+
+
+def line_starts_exact(src: str) -> list[int]:
+    """Find line start character offsets splitting only on \\r\\n, \\r, or \\n."""
+    starts = [0]
+    for m in _AST_LINE_BREAK_RE.finditer(src):
+        starts.append(m.end())
+    return starts
+
+
+def ast_source_offset(
+    src: str,
+    lineno: int,
+    col: int,
+    *,
+    line_starts: list[int] | None = None,
+) -> int:
+    """Map AST ``(lineno, col_offset)`` to an absolute character index in *src*.
+
+    On Python 3.8+, ``col_offset`` / ``end_col_offset`` are UTF-8 *byte* offsets
+    within the line — not Unicode character indices. Convert before slicing *src*
+    so a non-ASCII prefix cannot shift the rewrite window.
+    """
+    if lineno < 1 or col < 0:
+        return -1
+    if line_starts is None:
+        line_starts = line_starts_exact(src)
+    if lineno > len(line_starts):
+        return -1
+    line_start = line_starts[lineno - 1]
+    line_end = line_starts[lineno] if lineno < len(line_starts) else len(src)
+    line = src[line_start:line_end]
+    raw = line.encode("utf-8")
+    if col > len(raw):
+        return -1
+    # If *col* landed mid-codepoint, back up to a valid UTF-8 boundary.
+    while col > 0 and col < len(raw) and (raw[col] & 0xC0) == 0x80:
+        col -= 1
+    return line_start + len(raw[:col].decode("utf-8"))

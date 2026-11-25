@@ -1,0 +1,113 @@
+# WriterAgent - AI Writing Assistant for LibreOffice
+# Copyright (c) 2024 John Balis
+# Copyright (c) 2026 KeithCu (modifications and relicensing)
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+"""HTTP route registry for the framework.
+
+Stores route handlers keyed by (method, path). Modules register their
+handlers during initialize() and the HTTP server dispatches to them.
+"""
+
+from __future__ import annotations
+
+import logging
+import threading
+from typing import Any, Callable, NamedTuple
+
+log = logging.getLogger("writeragent.framework.http_routes")
+
+
+class Route(NamedTuple):
+    handler: Callable[..., Any]
+    raw: bool
+    main_thread: bool
+
+
+class HttpRouteRegistry:
+    """Registry of HTTP route handlers.
+
+    HTTP worker threads read this table while MCP toggle registers and
+    unregisters routes. ``_lock`` covers every read and write. ``GET /``
+    copies the keys under that lock: without it, ``list(self._routes)``
+    raises ``RuntimeError`` (dict changed size during iteration).
+
+    Hold :meth:`batch` across a multi-route register or unregister so a
+    concurrent read sees the set from before the batch or after it.
+
+    Usage::
+
+        routes = HttpRouteRegistry()
+
+        # Simple handler — receives (body, headers, query), returns (status, dict)
+        routes.add("GET", "/health", health_handler)
+
+        # Raw handler — receives the BaseHTTPRequestHandler, writes directly
+        routes.add("POST", "/mcp", mcp_handler, raw=True)
+
+        # Main-thread handler — wrapped in QueueExecutor.execute()
+        routes.add("GET", "/doc-info", doc_handler, main_thread=True)
+    """
+
+    _lock: threading.RLock
+
+    def __init__(self) -> None:
+        self._routes: dict[tuple[str, str], Route] = {}  # (method, path) -> Route
+        self._lock = threading.RLock()
+
+    def batch(self) -> threading.RLock:
+        """Lock held across several add/remove calls (reentrant)."""
+        return self._lock
+
+    def add(self, method: str, path: str, handler: Callable[..., Any], raw: bool = False, main_thread: bool = False) -> None:
+        """Register a route handler.
+
+        Args:
+            method:      HTTP method (GET, POST, DELETE, ...).
+            path:        Exact path (e.g. "/health"). No path params.
+            handler:     Callable. See ``raw`` for signature.
+            raw:         If False (default): fn(body, headers, query) -> (status, dict).
+                         If True: fn(http_handler) -> None (writes directly).
+            main_thread: If True, handler is wrapped in QueueExecutor.execute().
+        """
+        key = (method.upper(), path)
+        with self._lock:
+            if key in self._routes:
+                log.warning("Route %s %s already registered — overwriting", method, path)
+            self._routes[key] = Route(handler=handler, raw=raw, main_thread=main_thread)
+        log.debug("Route registered: %s %s (raw=%s, main_thread=%s)", method, path, raw, main_thread)
+
+    def remove(self, method: str, path: str) -> bool:
+        """Unregister a route."""
+        key = (method.upper(), path)
+        with self._lock:
+            removed = self._routes.pop(key, None)
+        if removed:
+            log.debug("Route removed: %s %s", method, path)
+        return removed is not None
+
+    def match(self, method: str, path: str) -> Route | None:
+        """Return Route(handler, raw, main_thread) or None."""
+        with self._lock:
+            return self._routes.get((method.upper(), path))
+
+    @property
+    def route_count(self) -> int:
+        with self._lock:
+            return len(self._routes)
+
+    def list_routes(self) -> list[tuple[str, str]]:
+        """Return a snapshot of (method, path) tuples."""
+        with self._lock:
+            return list(self._routes.keys())
