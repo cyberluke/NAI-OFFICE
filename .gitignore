@@ -233,11 +233,6 @@ graphify-out/
 /writer2027/publish-*.ps1
 /writer2027/smoke/
 /writer2027/tools/
-/writer2027/build_win.sh
-/writer2027/build_linux.sh
-/writer2027/build_mac.sh
-/writer2027/run_build.bat
-/writer2027/run_autogen_only.bat
 /ROADMAP*.md
 /roadmap*.md
 /docs/ROADMAP*.md

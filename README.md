@@ -113,7 +113,7 @@ Installers are produced in `workdir/installation/`.
 | `officelabs/` | CEF integration, sidebar host and the bundled AI extension |
 | `officelabs/writeragent/` | the AI extension: tools, MCP server and Creator Studio |
 | `instsetoo_native/`, `scp2/` | installer packaging and file lists |
-| `writer2027/` | Writer 2027 client stack and tests |
+| `writer2027/` | Writer 2027 client stack, tests and build drivers |
 
 ---
 
