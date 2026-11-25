@@ -47,6 +47,10 @@ conversion, no proprietary container.
 - **Preflight** — catch publication problems before you export, using the same rules the
   exporter applies.
 
+<p align="center">
+  <img src="assets/writer-2027.jpg" alt="NAI OFFICE Writer 2027 in dark mode, with the NAI Assistant sidebar open next to the document" width="960">
+</p>
+
 ### NAI Assistant
 
 An AI assistant that lives in the sidebar and understands the document you are editing.
